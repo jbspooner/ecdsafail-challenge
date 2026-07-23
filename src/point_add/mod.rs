@@ -1664,6 +1664,84 @@ pub fn build_builder() -> B {
 /// Deep-strip: remove CCX gates verified never-firing over 1e8 inputs.
 /// Applied as the FINAL pass because the index list was derived from the final
 /// emitted stream.
+// Build-time census: replicate eval's valid-input generation (target=k1*G,
+// offset=k2*G, expected=target+offset), run the op stream op-by-op tracking
+// which CCX gates ever fire (both controls simultaneously 1), and verify the
+// output register equals the expected sum. Returns (never-firing CCX indices,
+// #correct, #total). Reusing the trusted Simulator + curve avoids any
+// re-implementation risk. This is the tool that lets us re-derive the dead-gate
+// strip for a changed op stream (hardening) and verify an approximation is safe
+// across many inputs (not just the Fiat-Shamir test set).
+fn run_census(ops: &[Op], m_batches: usize) -> (Vec<usize>, usize, usize) {
+    use crate::sim::Simulator;
+    use crate::circuit::analyze_ops;
+    use alloy_primitives::U256;
+    use sha3::digest::{ExtendableOutput, Update, XofReader};
+
+    let curve = secp256k1_curve();
+    let (num_qubits, num_bits, _nr, regs) = analyze_ops(ops.iter());
+    assert_eq!(regs.len(), 4, "census expects 4 registers, got {}", regs.len());
+    const BATCH: usize = 64;
+    let n = m_batches * BATCH;
+
+    let mut ih = sha3::Shake256::default();
+    ih.update(b"census-inputs-v1");
+    let mut ixof = ih.finalize_xof();
+    let mut targets = Vec::with_capacity(n);
+    let mut offsets = Vec::with_capacity(n);
+    let mut expected = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut b0 = [0u8; 32];
+        let mut b1 = [0u8; 32];
+        ixof.read(&mut b0);
+        ixof.read(&mut b1);
+        let t = curve.mul(curve.gx, curve.gy, U256::from_le_bytes(b0));
+        let o = curve.mul(curve.gx, curve.gy, U256::from_le_bytes(b1));
+        let e = curve.add(t.0, t.1, o.0, o.1);
+        targets.push(t);
+        offsets.push(o);
+        expected.push(e);
+    }
+
+    let mut ever = vec![false; ops.len()];
+    let mut correct = 0usize;
+    let mut sh = sha3::Shake256::default();
+    sh.update(b"census-sim-v1");
+    let mut sxof = sh.finalize_xof();
+    let mut sim = Simulator::new(num_qubits as usize, num_bits as usize, &mut sxof);
+    for batch in 0..m_batches {
+        sim.clear_for_shot();
+        let bs = BATCH.min(n - batch * BATCH);
+        for shot in 0..bs {
+            let i = batch * BATCH + shot;
+            sim.set_register(&regs[0], targets[i].0, shot);
+            sim.set_register(&regs[1], targets[i].1, shot);
+            sim.set_register(&regs[2], offsets[i].0, shot);
+            sim.set_register(&regs[3], offsets[i].1, shot);
+        }
+        for (j, op) in ops.iter().enumerate() {
+            if op.kind == OperationType::CCX
+                && (sim.qubit(op.q_control1) & sim.qubit(op.q_control2)) != 0
+            {
+                ever[j] = true;
+            }
+            sim.apply_iter(std::iter::once(op));
+        }
+        for shot in 0..bs {
+            let i = batch * BATCH + shot;
+            if sim.get_register(&regs[0], shot) == expected[i].0
+                && sim.get_register(&regs[1], shot) == expected[i].1
+            {
+                correct += 1;
+            }
+        }
+    }
+    let dead: Vec<usize> = (0..ops.len())
+        .filter(|&j| ops[j].kind == OperationType::CCX && !ever[j])
+        .collect();
+    (dead, correct, n)
+}
+
 fn apply_d2_deep_strip(ops: Vec<Op>) -> Vec<Op> {
     use std::collections::HashSet;
     // Experiment gate: the baked strip is op-stream-specific; disable it to test
@@ -2220,7 +2298,34 @@ pub fn build() -> Vec<Op> {
     let ops = apply_m60_dead_t10(ops);
     let ops = ccz_self_inverse_cancel(ops);
     let ops = trailmix_ludicrous::constprop::ccx_final_cancel(ops);
-    let ops = apply_d2_deep_strip(ops);
+    let census_batches = std::env::var("TLM_CENSUS_BATCHES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64);
+    let ops = if std::env::var("TLM_DYNAMIC_STRIP").ok().as_deref() == Some("1") {
+        // Re-derive the dead-gate strip for THIS op stream via census, instead
+        // of the baked position list. Robust to stream changes.
+        let (dead, correct, total) = run_census(&ops, census_batches);
+        eprintln!(
+            "CENSUS(dynamic-strip) batches={census_batches} inputs={total} correct={correct}/{total} dynamic_dead_ccx={}",
+            dead.len()
+        );
+        use std::collections::HashSet;
+        let drop: HashSet<usize> = dead.into_iter().collect();
+        ops.into_iter().enumerate().filter(|(i, _)| !drop.contains(i)).map(|(_, o)| o).collect()
+    } else {
+        if std::env::var("TLM_CENSUS_REPORT").ok().as_deref() == Some("1") {
+            // Report only: census the (still-unstripped) stream to see how many
+            // gates the baked strip would need and whether the stream is correct.
+            let (dead, correct, total) = run_census(&ops, census_batches);
+            eprintln!(
+                "CENSUS(report) batches={census_batches} inputs={total} correct={correct}/{total} unstripped_dead_ccx={} baked_d2={}",
+                dead.len(),
+                d2_deep_strip::D2_DEEP_STRIP.len()
+            );
+        }
+        apply_d2_deep_strip(ops)
+    };
     apply_tail_nonce(ops, 706362233434)
 }
 
