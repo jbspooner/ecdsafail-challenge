@@ -1666,6 +1666,11 @@ pub fn build_builder() -> B {
 /// emitted stream.
 fn apply_d2_deep_strip(ops: Vec<Op>) -> Vec<Op> {
     use std::collections::HashSet;
+    // Experiment gate: the baked strip is op-stream-specific; disable it to test
+    // stream-changing ideas without the strip corrupting into wrong gates.
+    if std::env::var("TLM_DISABLE_D2").ok().as_deref() == Some("1") {
+        return ops;
+    }
     let drop: HashSet<usize> = d2_deep_strip::D2_DEEP_STRIP.iter().copied().collect();
     ops.into_iter().enumerate().filter(|(i, _)| !drop.contains(i)).map(|(_, o)| o).collect()
 }

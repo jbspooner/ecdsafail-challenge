@@ -1509,7 +1509,8 @@ pub fn controlled_mod_add_k(circ: &mut B, ctrl: &QubitId, x: &[QubitId], y: &[Qu
     debug_assert_eq!(MSBS, PAD);
 
     circ.set_phase("tlm_apply_forward_mod_add_clean");
-    controlled_lt_msbs_conditional(circ, Some(ctrl), &y[..n], &x[..n], MSBS, anc);
+    let msbs = std::env::var("TLM_APPLY_MSBS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(MSBS);
+    controlled_lt_msbs_conditional(circ, Some(ctrl), &y[..n], &x[..n], msbs, anc);
 }
 
 pub fn mod_sub(circ: &mut B, x: &[QubitId], y: &[QubitId]) {

@@ -1407,7 +1407,8 @@ fn controlled_mod_sub_vented(circ: &mut B, ctrl: &QubitId, x: &[QubitId], y: &[Q
     }
 
     circ.set_phase("tlm_apply_inverse_mod_sub_clean");
-    let k = arith::MSBS.min(n);
+    let msbs = std::env::var("TLM_APPLY_MSBS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(arith::MSBS);
+    let k = msbs.min(n);
     let lo = n - k;
     let ctrl = *ctrl;
     let bit = circ.alloc_bit();
