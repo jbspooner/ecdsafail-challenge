@@ -1703,7 +1703,8 @@ fn run_census(ops: &[Op], m_batches: usize) -> (Vec<usize>, usize, usize) {
         expected.push(e);
     }
 
-    let mut ever = vec![false; ops.len()];
+    let mut fired = vec![0u64; ops.len()]; // #shots the CCX actually flips (cond & c1 & c2)
+    let mut billed = vec![0u64; ops.len()]; // #shots the CCX is billed (condition stack holds)
     let mut correct = 0usize;
     let mut sh = sha3::Shake256::default();
     sh.update(b"census-sim-v1");
@@ -1712,6 +1713,7 @@ fn run_census(ops: &[Op], m_batches: usize) -> (Vec<usize>, usize, usize) {
     for batch in 0..m_batches {
         sim.clear_for_shot();
         let bs = BATCH.min(n - batch * BATCH);
+        let live_mask: u64 = if bs >= 64 { u64::MAX } else { (1u64 << bs) - 1 };
         for shot in 0..bs {
             let i = batch * BATCH + shot;
             sim.set_register(&regs[0], targets[i].0, shot);
@@ -1734,9 +1736,8 @@ fn run_census(ops: &[Op], m_batches: usize) -> (Vec<usize>, usize, usize) {
             match op.kind {
                 OperationType::CCX => {
                     let v = cond & sim.qubit(op.q_control1) & sim.qubit(op.q_control2);
-                    if v != 0 {
-                        ever[j] = true;
-                    }
+                    billed[j] += (cond & live_mask).count_ones() as u64;
+                    fired[j] += (v & live_mask).count_ones() as u64;
                     *sim.qubit_mut(op.q_target) ^= v;
                 }
                 OperationType::CX => {
@@ -1794,8 +1795,41 @@ fn run_census(ops: &[Op], m_batches: usize) -> (Vec<usize>, usize, usize) {
         }
     }
     let dead: Vec<usize> = (0..ops.len())
-        .filter(|&j| ops[j].kind == OperationType::CCX && !ever[j])
+        .filter(|&j| ops[j].kind == OperationType::CCX && fired[j] == 0)
         .collect();
+    // Gate-utilization report: billed (what you pay) vs fired (work done).
+    if std::env::var("TLM_CENSUS_FIRERATE").ok().as_deref() == Some("1") {
+        let tot = n as f64;
+        let mut nccx = 0u64;
+        let mut sum_billed = 0.0f64;
+        let mut sum_fired = 0.0f64;
+        // buckets over EXECUTED fire rate = fired/total among gates that are billed
+        let (mut z, mut b1, mut b5, mut b25, mut b50, mut b95, mut hi) = (0u64, 0, 0, 0, 0, 0, 0);
+        for (j, op) in ops.iter().enumerate() {
+            if op.kind != OperationType::CCX {
+                continue;
+            }
+            nccx += 1;
+            sum_billed += billed[j] as f64 / tot;
+            sum_fired += fired[j] as f64 / tot;
+            let r = fired[j] as f64 / tot; // fires per shot
+            if r == 0.0 { z += 1; }
+            else if r < 0.01 { b1 += 1; }
+            else if r < 0.05 { b5 += 1; }
+            else if r < 0.25 { b25 += 1; }
+            else if r < 0.50 { b50 += 1; }
+            else if r < 0.95 { b95 += 1; }
+            else { hi += 1; }
+        }
+        eprintln!(
+            "CENSUS_FIRERATE emitted_ccx={nccx} executed_billed={:.0} work_done={:.0} wasted_billing={:.0} ({:.1}% of executed)",
+            sum_billed, sum_fired, sum_billed - sum_fired,
+            100.0 * (sum_billed - sum_fired) / sum_billed.max(1.0)
+        );
+        eprintln!(
+            "CENSUS_FIRERATE fire-rate buckets: =0:{z} <1%:{b1} 1-5%:{b5} 5-25%:{b25} 25-50%:{b50} 50-95%:{b95} >=95%:{hi}"
+        );
+    }
     (dead, correct, n)
 }
 
