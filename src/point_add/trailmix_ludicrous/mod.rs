@@ -107,6 +107,8 @@ struct Sched {
     ffg: (Vec<usize>, usize),
     hyb_v: (Vec<usize>, usize),
     sqrow_k: (Vec<usize>, usize),
+    sched_j2: (Vec<usize>, usize),
+    gap_j2: (Vec<usize>, usize),
 }
 
 thread_local!(static SCHED: RefCell<Sched> = RefCell::new(Sched::default()));
@@ -258,6 +260,11 @@ fn take_cout_fit(selected: usize) -> ScheduleFit {
 }
 fn next_sqrow_k() -> usize { SCHED.with(|s| step(&mut s.borrow_mut().sqrow_k, usize::MAX)) }
 
+// Index accessors (not stepped): the per-divstep working width and comparator
+// gap, routed through the runtime SCHED so LUD_SCHED_FILE can override them.
+pub(crate) fn sched_j2_at(i: usize) -> usize { SCHED.with(|s| s.borrow().sched_j2.0[i]) }
+pub(crate) fn gap_j2_at(i: usize) -> usize { SCHED.with(|s| s.borrow().gap_j2.0[i]) }
+
 fn load_schedule() {
     reset_schedule_fit_call_indices();
     arith::reset_ffg_call_index();
@@ -302,6 +309,74 @@ fn load_schedule() {
         s.ffg.0 = fold_g(schedule::FFG_G);
         s.hyb_v.0 = schedule::HYB_V.to_vec();
         s.sqrow_k.0 = schedule::SQ_ROW_K.to_vec();
+        s.sched_j2.0 = schedule::SCHED_J2.iter().map(|&x| x as usize).collect();
+        s.gap_j2.0 = schedule::GAP_J2.iter().map(|&x| x as usize).collect();
+
+        // Search axe: override any schedule at runtime from a file so a search
+        // can vary the compile-time arrays without a 76s recompile per candidate.
+        // Format: one "name=v1,v2,..." per line (# comments ok). Lengths must
+        // match the default exactly. Fails LOUD on any malformed input so a
+        // search never silently optimizes the wrong thing.
+        if let Ok(path) = std::env::var("LUD_SCHED_FILE") {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("LUD_SCHED_FILE {path}: {e}"));
+            let parse_i64 = |name: &str, rhs: &str| -> Vec<i64> {
+                rhs.split(',')
+                    .filter(|t| !t.trim().is_empty())
+                    .map(|t| t.trim().parse::<i64>()
+                        .unwrap_or_else(|e| panic!("LUD_SCHED_FILE {name}: bad int '{t}': {e}")))
+                    .collect()
+            };
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let (name, rhs) = line.split_once('=')
+                    .unwrap_or_else(|| panic!("LUD_SCHED_FILE: no '=' in line '{line}'"));
+                let name = name.trim();
+                let vals = parse_i64(name, rhs);
+                macro_rules! ovr {
+                    ($field:expr, $ty:ty) => {{
+                        let want = $field.len();
+                        assert_eq!(vals.len(), want,
+                            "LUD_SCHED_FILE {}: len {} != expected {}", name, vals.len(), want);
+                        $field = vals.iter().map(|&v| v as $ty).collect();
+                    }};
+                }
+                match name {
+                    "gcd_k" => ovr!(s.gcd_k.0, usize),
+                    "gcd_branch" => ovr!(s.gcd_branch.0, u8),
+                    "cout_k" => ovr!(s.cout_k.0, usize),
+                    "fold" => ovr!(s.fold.0, i32),
+                    "cmp_k" => ovr!(s.cmp_k.0, usize),
+                    "ffg" => ovr!(s.ffg.0, usize),
+                    "hyb_v" => ovr!(s.hyb_v.0, usize),
+                    "sqrow_k" => ovr!(s.sqrow_k.0, usize),
+                    "sched_j2" => ovr!(s.sched_j2.0, usize),
+                    "gap_j2" => ovr!(s.gap_j2.0, usize),
+                    other => panic!("LUD_SCHED_FILE: unknown schedule '{other}'"),
+                }
+            }
+        }
+
+        // Search axe: dump the active schedules in LUD_SCHED_FILE format, then
+        // exit. Used to seed the search with the exact current (baseline) values.
+        if std::env::var("LUD_SCHED_DUMP").is_ok() {
+            let join = |v: &[i64]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+            let as_i64 = |v: &[usize]| v.iter().map(|&x| x as i64).collect::<Vec<_>>();
+            println!("gcd_k={}", join(&as_i64(&s.gcd_k.0)));
+            println!("gcd_branch={}", join(&s.gcd_branch.0.iter().map(|&x| x as i64).collect::<Vec<_>>()));
+            println!("cout_k={}", join(&as_i64(&s.cout_k.0)));
+            println!("fold={}", join(&s.fold.0.iter().map(|&x| x as i64).collect::<Vec<_>>()));
+            println!("cmp_k={}", join(&as_i64(&s.cmp_k.0)));
+            println!("ffg={}", join(&as_i64(&s.ffg.0)));
+            println!("hyb_v={}", join(&as_i64(&s.hyb_v.0)));
+            println!("sqrow_k={}", join(&as_i64(&s.sqrow_k.0)));
+            println!("sched_j2={}", join(&as_i64(&s.sched_j2.0)));
+            println!("gap_j2={}", join(&as_i64(&s.gap_j2.0)));
+            std::process::exit(0);
+        }
     });
 }
 

@@ -1,6 +1,6 @@
 
 use super::arith::{self, F_SECP256K1};
-use super::schedule::{GAP_J2, ITERS, JUMP, SCHED_J2};
+use super::schedule::{ITERS, JUMP};
 
 fn gap_j2_delta() -> usize {
     std::env::var("TLM_GAP_J2_DELTA")
@@ -18,7 +18,7 @@ fn gap_j2_mask_trunc_only() -> bool {
 // baseline window is ALREADY a strict truncation (GAP_J2[i] < current_n),
 // leaving the exact-comparison tail steps untouched.
 fn cmp_window(i: usize, current_n: usize) -> usize {
-    let g = GAP_J2[i] as usize;
+    let g = super::gap_j2_at(i);
     let base = g.min(current_n).max(1);
     let d = gap_j2_delta();
     if d == 0 {
@@ -784,7 +784,7 @@ pub fn forward_gcd_jump(circ: &mut B, v: &mut Vec<QubitId>, apply_inv: Option<(&
         } else {
             "tlm_multiply_gcd_forward_shift"
         });
-        let current_n = (SCHED_J2[i] as usize).max(1);
+        let current_n = super::sched_j2_at(i).max(1);
         while u.len() > current_n {
             let q = u.pop().expect("u nonempty");
             circ.zero_and_free(q);
@@ -1030,7 +1030,7 @@ pub fn reverse_gcd_jump(circ: &mut B, v: &mut Vec<QubitId>, tape: &mut Vec<Qubit
         } else {
             "tlm_inverse_gcd_reverse_decode"
         });
-        let current_n = (SCHED_J2[i] as usize).max(1);
+        let current_n = super::sched_j2_at(i).max(1);
         while u.len() < current_n {
             u.push(circ.alloc_qubit());
         }
