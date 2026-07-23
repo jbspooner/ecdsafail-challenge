@@ -357,6 +357,15 @@ fn install_q1153_submission_defaults() {
 pub fn build_trailmix_ludicrous_ops() -> Vec<Op> {
     install_q1153_submission_defaults();
     let mut circ = B::new();
+    // Fast proxy mode: build the op stream logically (counters + qubit
+    // liveness) without materializing the ~10M-op Vec or running the trusted
+    // eval, so a config search can rank candidates in seconds instead of
+    // minutes. Reports emitted CCX/CCZ (pre-constprop/fanout/strip) and the
+    // scored qubit count (next_qubit = max id + 1), then exits.
+    let proxy_count_only = std::env::var("POINT_ADD_COUNT_ONLY").ok().as_deref() == Some("1");
+    if proxy_count_only {
+        circ.count_only = true;
+    }
     load_schedule();
 
     let x2 = circ.alloc_qubits(N);
@@ -487,6 +496,21 @@ pub fn build_trailmix_ludicrous_ops() -> Vec<Op> {
             );
         }
         eprintln!("TLM_CCX_TOTAL {grand} phases={}", v.len());
+    }
+
+    if proxy_count_only {
+        let ccx = circ.counted_kind_ops[OperationType::CCX as usize];
+        let ccz = circ.counted_kind_ops[OperationType::CCZ as usize];
+        eprintln!(
+            "PROXY_COUNT toffoli={} ccx={} ccz={} scored_qubits={} peak_live={} emitted_ops={}",
+            ccx + ccz,
+            ccx,
+            ccz,
+            circ.next_qubit,
+            circ.peak_qubits,
+            circ.counted_ops,
+        );
+        std::process::exit(0);
     }
 
     let ops = std::mem::take(&mut circ.ops);
