@@ -1719,13 +1719,70 @@ fn run_census(ops: &[Op], m_batches: usize) -> (Vec<usize>, usize, usize) {
             sim.set_register(&regs[2], offsets[i].0, shot);
             sim.set_register(&regs[3], offsets[i].1, shot);
         }
+        // Re-implement the sim's COMPUTATIONAL core with a persistent condition
+        // stack (apply_iter resets its stack per call, so we can't call it
+        // per-op). Qubit values are RNG/phase-independent for this Gidney-style
+        // circuit, so we skip phase ops and treat Hmr/R as demolition-to-0;
+        // correctness is self-checked against `expected` below.
+        let mut cstack: Vec<u64> = Vec::new();
+        let mut base: u64 = u64::MAX;
         for (j, op) in ops.iter().enumerate() {
-            if op.kind == OperationType::CCX
-                && (sim.qubit(op.q_control1) & sim.qubit(op.q_control2)) != 0
-            {
-                ever[j] = true;
+            let mut cond = base;
+            if op.c_condition != crate::circuit::NO_BIT {
+                cond &= sim.bit(op.c_condition);
             }
-            sim.apply_iter(std::iter::once(op));
+            match op.kind {
+                OperationType::CCX => {
+                    let v = cond & sim.qubit(op.q_control1) & sim.qubit(op.q_control2);
+                    if v != 0 {
+                        ever[j] = true;
+                    }
+                    *sim.qubit_mut(op.q_target) ^= v;
+                }
+                OperationType::CX => {
+                    let v = cond & sim.qubit(op.q_control1);
+                    *sim.qubit_mut(op.q_target) ^= v;
+                }
+                OperationType::Swap => {
+                    let mut a = sim.qubit(op.q_control1);
+                    let mut b = sim.qubit(op.q_target);
+                    a ^= b;
+                    b ^= cond & a;
+                    a ^= b;
+                    *sim.qubit_mut(op.q_control1) = a;
+                    *sim.qubit_mut(op.q_target) = b;
+                }
+                OperationType::X => {
+                    *sim.qubit_mut(op.q_target) ^= cond;
+                }
+                OperationType::Hmr => {
+                    *sim.bit_mut(op.c_target) &= !cond;
+                    *sim.qubit_mut(op.q_target) &= !cond;
+                }
+                OperationType::R => {
+                    *sim.qubit_mut(op.q_target) &= !cond;
+                }
+                OperationType::BitInvert => {
+                    *sim.bit_mut(op.c_target) ^= cond;
+                }
+                OperationType::BitStore0 => {
+                    *sim.bit_mut(op.c_target) &= !cond;
+                }
+                OperationType::BitStore1 => {
+                    *sim.bit_mut(op.c_target) |= cond;
+                }
+                OperationType::PushCondition => {
+                    cstack.push(base);
+                    base &= sim.bit(op.c_condition);
+                }
+                OperationType::PopCondition => {
+                    if let Some(v) = cstack.pop() {
+                        base = v;
+                    }
+                }
+                // phase ops (CCZ/CZ/Z/Neg) don't change qubit values; registers/debug are no-ops
+                _ => {}
+            }
         }
         for shot in 0..bs {
             let i = batch * BATCH + shot;
@@ -2247,6 +2304,20 @@ pub fn build() -> Vec<Op> {
     set_default_env("TLM_FUSED_CLEAN_FOLD_SKIP_TOP31", "1");
     set_default_env("TLM_GIDNEY_SKIP_SMALL_RESIDUAL_DEAD", "1");
     let mut ops = trailmix_ludicrous::build_trailmix_ludicrous_ops();
+
+    // Fast census point: runs on the post-constprop, PRE-fanout stream so it
+    // completes quickly (before the multi-minute single_ccx_fanout). Validates
+    // the census mechanism and reports raw-stream correctness + dead-gate count.
+    if std::env::var("TLM_CENSUS_PREFANOUT").ok().as_deref() == Some("1") {
+        let m = std::env::var("TLM_CENSUS_BATCHES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+        let (dead, correct, total) = run_census(&ops, m);
+        eprintln!(
+            "CENSUS(prefanout) batches={m} inputs={total} correct={correct}/{total} dead_ccx={} total_ccx={}",
+            dead.len(),
+            ops.iter().filter(|o| o.kind == OperationType::CCX).count()
+        );
+        std::process::exit(0);
+    }
 
     if let Ok(k) = std::env::var("TLM_SEED_PERTURB").unwrap_or_default().parse::<usize>() {
         for _ in 0..k {
