@@ -1705,6 +1705,8 @@ fn run_census(ops: &[Op], m_batches: usize) -> (Vec<usize>, usize, usize) {
 
     let mut fired = vec![0u64; ops.len()]; // #shots the CCX actually flips (cond & c1 & c2)
     let mut billed = vec![0u64; ops.len()]; // #shots the CCX is billed (condition stack holds)
+    let entropy = std::env::var("TLM_CENSUS_ENTROPY").ok().as_deref() == Some("1");
+    let mut fire_hash = vec![0u64; ops.len()]; // rolling hash of each gate's fire-vector across shots
     let mut correct = 0usize;
     let mut sh = sha3::Shake256::default();
     sh.update(b"census-sim-v1");
@@ -1738,6 +1740,11 @@ fn run_census(ops: &[Op], m_batches: usize) -> (Vec<usize>, usize, usize) {
                     let v = cond & sim.qubit(op.q_control1) & sim.qubit(op.q_control2);
                     billed[j] += (cond & live_mask).count_ones() as u64;
                     fired[j] += (v & live_mask).count_ones() as u64;
+                    if entropy {
+                        fire_hash[j] = fire_hash[j]
+                            .wrapping_mul(0x100_0000_01b3)
+                            .wrapping_add(v & live_mask);
+                    }
                     *sim.qubit_mut(op.q_target) ^= v;
                 }
                 OperationType::CX => {
@@ -1828,6 +1835,47 @@ fn run_census(ops: &[Op], m_batches: usize) -> (Vec<usize>, usize, usize) {
         );
         eprintln!(
             "CENSUS_FIRERATE fire-rate buckets: =0:{z} <1%:{b1} 1-5%:{b5} 5-25%:{b25} 25-50%:{b50} 50-95%:{b95} >=95%:{hi}"
+        );
+    }
+    if entropy {
+        use std::collections::HashMap;
+        let tot = n as f64;
+        let ln2 = std::f64::consts::LN_2;
+        let mut nccx = 0u64;
+        let mut sum_h = 0.0f64; // sum of marginal entropies H(fire-rate), in bits
+        let mut always = 0u64; // fire-rate ~1.0 -> equivalent to free X
+        let mut clusters: HashMap<u64, u32> = HashMap::new();
+        for (j, op) in ops.iter().enumerate() {
+            if op.kind != OperationType::CCX {
+                continue;
+            }
+            nccx += 1;
+            let p = fired[j] as f64 / tot;
+            if p > 0.0 && p < 1.0 {
+                sum_h += (-(p * p.ln() + (1.0 - p) * (1.0 - p).ln())) / ln2;
+            }
+            if p >= 0.999 {
+                always += 1;
+            }
+            if fired[j] > 0 {
+                *clusters.entry(fire_hash[j]).or_insert(0) += 1;
+            }
+        }
+        let distinct = clusters.len() as u64;
+        let firing: u64 = clusters.values().map(|&c| c as u64).sum();
+        let redundant: u64 = clusters.values().filter(|&&c| c > 1).map(|&c| c as u64).sum();
+        let mut sizes: Vec<u32> = clusters.into_values().collect();
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        let top: Vec<u32> = sizes.iter().take(8).copied().collect();
+        eprintln!(
+            "CENSUS_ENTROPY ccx={nccx} sum_marginal_entropy={:.0}bits (avg {:.3} bits/gate) always_fire(=free X)={always}",
+            sum_h,
+            sum_h / nccx as f64
+        );
+        eprintln!(
+            "CENSUS_ENTROPY firing_gates={firing} distinct_fire_patterns={distinct} in_shared_pattern(redundant)={redundant} ({:.1}%) top_cluster_sizes={:?}",
+            100.0 * redundant as f64 / firing.max(1) as f64,
+            top
         );
     }
     (dead, correct, n)
@@ -2371,6 +2419,21 @@ pub fn build() -> Vec<Op> {
         .as_deref()
         == Some("1")
     {
+        // Fast analysis path (skips the slow fanout): census the pre-fanout
+        // stream so the gate-utilization report is reachable without a full build.
+        if std::env::var("TLM_CENSUS_FIRERATE").ok().as_deref() == Some("1")
+            || std::env::var("TLM_CENSUS_REPORT").ok().as_deref() == Some("1")
+        {
+            let m = std::env::var("TLM_CENSUS_BATCHES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(64);
+            let (dead, correct, total) = run_census(&ops, m);
+            eprintln!(
+                "CENSUS(prefanout) batches={m} inputs={total} correct={correct}/{total} never_firing_ccx={}",
+                dead.len()
+            );
+        }
         return ops;
     }
     let input_ops = ops.len();
