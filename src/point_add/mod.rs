@@ -1962,6 +1962,25 @@ fn apply_d2_deep_strip(ops: Vec<Op>) -> Vec<Op> {
     }
 
     let drop: HashSet<usize> = d2_deep_strip::D2_DEEP_STRIP.iter().copied().collect();
+    // Self-check, mirroring apply_m60_dead_t10. The baked indices name CCX gates
+    // in the stream they were censused against; against any other stream they
+    // land on whatever now occupies those positions. Measured on a stream
+    // misaligned by only 336 ops, the 1999 indices hit 1675 CX, 273 CCX, 30 X,
+    // 6 PopCondition, 4 R, 4 Hmr, 4 PushCondition and 3 CZ - and dropping a
+    // PushCondition without its PopCondition unbalances the condition stack for
+    // the whole remainder of the circuit. That is the "9024/9024 classical +
+    // 141/141 ancilla garbage" signature seen in every off-baseline experiment
+    // in this repo's logs, and until now it was SILENT: it read as the
+    // experiment's fault rather than the strip's. Abort instead.
+    for &i in &drop {
+        let kind = ops.get(i).map(|o| o.kind);
+        assert!(
+            kind == Some(OperationType::CCX),
+            "[D2] deep-strip index {i} is not a CCX in this build (found {kind:?}); \
+             strip is misaligned with this stream -- aborting rather than emitting \
+             a corrupt circuit. Re-derive the strip, or use TLM_STRIP_BY_FP=1.",
+        );
+    }
     ops.into_iter().enumerate().filter(|(i, _)| !drop.contains(i)).map(|(_, o)| o).collect()
 }
 
