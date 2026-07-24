@@ -24,6 +24,7 @@ pub mod trailmix_ludicrous;
 mod single_ccx_fanout;
 mod m60_dead_t10;
 mod d2_deep_strip;
+mod d2_strip_fp;
 
 thread_local! {
     static D1_PHASE_CORRECTED_PRODUCT_CORE_SCOPE: std::cell::Cell<bool> =
@@ -1881,13 +1882,85 @@ fn run_census(ops: &[Op], m_batches: usize) -> (Vec<usize>, usize, usize) {
     (dead, correct, n)
 }
 
+/// Position-independent identity of an op: what the gate *is*, not where it sits.
+/// (r_target/c_target carry no meaning for the scored CCX gates in the strip.)
+type OpFp = (u8, u64, u64, u64, u64);
+fn op_fp(o: &Op) -> OpFp {
+    (
+        o.kind as u8,
+        o.q_control2.0,
+        o.q_control1.0,
+        o.q_target.0,
+        o.c_condition.0,
+    )
+}
+
 fn apply_d2_deep_strip(ops: Vec<Op>) -> Vec<Op> {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     // Experiment gate: the baked strip is op-stream-specific; disable it to test
     // stream-changing ideas without the strip corrupting into wrong gates.
     if std::env::var("TLM_DISABLE_D2").ok().as_deref() == Some("1") {
         return ops;
     }
+
+    // Dump mode: re-express the baked absolute-index strip as (fingerprint,
+    // occurrence-rank) pairs against THIS stream, so it can be re-anchored by
+    // content. Run once on an unmodified baseline build to generate the table.
+    if std::env::var("TLM_DUMP_STRIP_FP").ok().as_deref() == Some("1") {
+        let drop: HashSet<usize> = d2_deep_strip::D2_DEEP_STRIP.iter().copied().collect();
+        let mut seen: HashMap<OpFp, u32> = HashMap::new();
+        let mut rows: Vec<(OpFp, u32)> = Vec::with_capacity(drop.len());
+        for (i, o) in ops.iter().enumerate() {
+            let fp = op_fp(o);
+            let rank = *seen.get(&fp).unwrap_or(&0);
+            if drop.contains(&i) {
+                rows.push((fp, rank));
+            }
+            seen.insert(fp, rank + 1);
+        }
+        eprintln!("STRIP_FP_DUMP_BEGIN n={}", rows.len());
+        for ((k, c2, c1, t, cc), r) in &rows {
+            eprintln!("FP {k} {c2} {c1} {t} {cc} {r}");
+        }
+        eprintln!("STRIP_FP_DUMP_END");
+    }
+
+    // Content-addressed strip: locate the SAME 1999 gates by (fingerprint,
+    // occurrence-rank) rather than by absolute index, so a stream-changing
+    // optimization elsewhere does not silently retarget the strip onto live
+    // gates. Fails CLOSED: if the full set does not match, strip nothing.
+    if std::env::var("TLM_STRIP_BY_FP").ok().as_deref() == Some("1") {
+        let want: HashSet<(OpFp, u32)> = d2_strip_fp::D2_STRIP_FP
+            .iter()
+            .map(|&(k, c2, c1, t, cc, r)| ((k, c2, c1, t, cc), r))
+            .collect();
+        let mut seen: HashMap<OpFp, u32> = HashMap::new();
+        let mut drop_idx: HashSet<usize> = HashSet::with_capacity(want.len());
+        for (i, o) in ops.iter().enumerate() {
+            let fp = op_fp(o);
+            let rank = *seen.get(&fp).unwrap_or(&0);
+            if want.contains(&(fp, rank)) {
+                drop_idx.insert(i);
+            }
+            seen.insert(fp, rank + 1);
+        }
+        if drop_idx.len() != want.len() {
+            eprintln!(
+                "STRIP_BY_FP: MATCH FAILED ({}/{}) - failing closed, stripping nothing",
+                drop_idx.len(),
+                want.len()
+            );
+            return ops;
+        }
+        eprintln!("STRIP_BY_FP: matched {}/{} gates by content", drop_idx.len(), want.len());
+        return ops
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !drop_idx.contains(i))
+            .map(|(_, o)| o)
+            .collect();
+    }
+
     let drop: HashSet<usize> = d2_deep_strip::D2_DEEP_STRIP.iter().copied().collect();
     ops.into_iter().enumerate().filter(|(i, _)| !drop.contains(i)).map(|(_, o)| o).collect()
 }
